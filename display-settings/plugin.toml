@@ -1,0 +1,24 @@
+id = "local/display-settings"
+name = "Display Settings"
+description = "Manage Hyprland displays from a native Noctalia panel."
+version = "1.3.0"
+plugin_api = 42
+author = "local"
+icon = "device-desktop"
+
+[[shortcut]]
+id = "open"
+entry = "shortcut.luau"
+
+[[widget]]
+id = "button"
+entry = "widget.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 432
+height = "content"
+max_height = 470
+placement = "attached"
+open_near_click = true

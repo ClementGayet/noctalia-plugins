@@ -1,0 +1,524 @@
+#!/usr/bin/python3
+"""Hyprland backend for Noctalia's Display Settings plugin."""
+
+from dataclasses import asdict, dataclass, field, replace
+import fcntl
+from itertools import combinations
+import json
+from math import gcd, hypot
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+from time import sleep
+
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+LAYOUT_FILE = CONFIG_HOME / "hypr" / "display-layout.lua"
+WORKSPACE_PREFERENCES = CONFIG_HOME / "hypr" / "display-workspace-preferences.lua"
+MODE = re.compile(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)")
+CONNECTOR = re.compile(r"[A-Za-z0-9._-]+")
+OFF_RULE = ", disabled = disable_outputs"
+SCALE_PRESETS = (1, 1.25, 1.6, 2, 3, 4)
+
+@dataclass
+class Display:
+    name: str
+    label: str
+    modes: list[str] = field(compare=False)
+    mode: str
+    x: int
+    y: int
+    scale: float
+    transform: int
+    mirror: str
+    focused: bool = field(default=False, compare=False)
+    enabled: bool = True
+    active_workspace: str = field(default="", compare=False)
+
+    @property
+    def extended(self):
+        return self.enabled and not self.mirror
+
+    def dimensions(self):
+        mode = MODE.fullmatch(self.mode)
+        if mode is None:
+            raise ValueError(f"{self.name} has no usable display mode.")
+        return tuple(map(int, mode.groups()[:2]))
+
+    def size(self):
+        width, height = (value / self.scale for value in self.dimensions())
+        return (height, width) if self.transform % 2 else (width, height)
+
+    def rect(self):
+        width, height = self.size()
+        return self.x, self.y, round(width), round(height)
+
+    def rule(self, saved=False):
+        quote = json.dumps
+        preferred = self.mode == "preferred"
+        position = "auto" if preferred else f"{self.x}x{self.y}"
+        scale = '"auto"' if preferred else f"{self.scale:.9g}"
+        disabled = (OFF_RULE if not self.enabled else "") if saved else (
+            ", disabled = false" if self.enabled else ", disabled = true"
+        )
+        return (
+            f"hl.monitor({{ output = {quote(self.name)}, mode = {quote(self.mode)}, "
+            f"position = {quote(position)}, scale = {scale}, "
+            f"transform = {self.transform}, mirror = {quote(self.mirror)}{disabled} }})"
+        )
+
+
+def hyprctl(*args):
+    try:
+        result = subprocess.run(
+            ["/usr/bin/hyprctl", *args], capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(f"Could not reach Hyprland. {error}") from error
+    reply = result.stdout.strip()
+    if result.returncode or (args[0] in ("eval", "reload") and reply != "ok"):
+        raise ValueError(result.stderr.strip() or reply or "Hyprland rejected the request.")
+    return reply
+
+
+def read_displays():
+    outputs = json.loads(hyprctl("-j", "monitors", "all"))
+    saved = saved_rules()
+    displays = {}
+    for output in outputs:
+        name = output["name"]
+        if not CONNECTOR.fullmatch(name) or name == "FALLBACK" or name.startswith("HEADLESS-"):
+            continue
+        enabled = not output.get("disabled", False)
+        modes = [mode.removesuffix("Hz") for mode in output.get("availableModes", [])]
+        modes = [mode for mode in modes if MODE.fullmatch(mode)]
+        width, height, hz = (output.get(key, 0) for key in ("width", "height", "refreshRate"))
+        resolution = f"{width}x{height}"
+        mode = modes[0] if modes else "preferred"
+        if width and height and hz:
+            default_mode = f"{resolution}@{hz:.3f}".rstrip("0").rstrip(".")
+            matching_modes = [item for item in modes if item.startswith(resolution + "@")]
+            mode = min(matching_modes, key=lambda item: abs(float(item.split("@")[1]) - hz),
+                       default=default_mode)
+            if abs(float(mode.split("@")[1]) - hz) > 0.015:
+                mode = default_mode
+        mirror = output.get("mirrorOf") or ""
+        if isinstance(mirror, int) or str(mirror).isdigit():
+            mirror = next((item["name"] for item in outputs if str(item["id"]) == str(mirror)), "")
+        mirror = "" if mirror == "none" else mirror
+        x, y = output.get("x", 0), output.get("y", 0)
+        scale, transform = output.get("scale") or 1, output.get("transform", 0)
+        if (mirror or not enabled) and name in saved:
+            position = re.search(r'position = "(-?\d+)x(-?\d+)"', saved[name])
+            if position:
+                x, y = map(int, position.groups())
+        if not enabled and name in saved:
+            rule = re.search(r'mode = "([^"]+)", position = "[^"]+", scale = ([\d.eE+-]+), '
+                             r'transform = (\d+), mirror = "([^"]*)"', saved[name])
+            if rule:
+                mode, scale, transform, mirror = rule.groups()
+                scale, transform = float(scale), int(transform)
+        model = (output.get("model") or "").strip()
+        if not model or re.fullmatch(r"(?:0x)?[0-9a-f]+", model, re.I):
+            model = output.get("make") or name
+        workspace = output.get("activeWorkspace") or {}
+        workspace_id, workspace_name = workspace.get("id") or 0, workspace.get("name") or ""
+        active_workspace = ""
+        if enabled and isinstance(workspace_id, int) and workspace_id > 0:
+            active_workspace = str(workspace_id)
+        elif enabled and workspace_name not in ("", "0") and not workspace_name.startswith("special:"):
+            active_workspace = "name:" + workspace_name.removeprefix("name:")
+        displays[name] = Display(
+            name, "Built-in Display" if name.startswith(("eDP-", "LVDS-", "DSI-")) else model,
+            list(dict.fromkeys([item for item in (mode, *modes) if MODE.fullmatch(item)])),
+            mode, x, y, scale, transform,
+            mirror, output.get("focused", False), enabled, active_workspace,
+        )
+    return displays
+
+
+def overlaps(first, second):
+    x, y, width, height = first
+    other_x, other_y, other_width, other_height = second
+    return (
+        x < other_x + other_width and other_x < x + width
+        and y < other_y + other_height and other_y < y + height
+    )
+
+
+def validate(displays):
+    extended = {screen.name: screen for screen in displays.values() if screen.extended}
+    if not extended:
+        raise ValueError("Keep at least one display on in Extend mode.")
+    for screen in displays.values():
+        if not screen.enabled:
+            continue
+        if screen.mirror and screen.mirror not in extended:
+            raise ValueError(f"{screen.name} needs an extended display as its mirror source.")
+        if screen.mode != "preferred" and any(abs(size - round(size)) > 0.01 for size in screen.size()):
+            raise ValueError(f"Choose a scale that gives {screen.name} whole logical pixels.")
+    for first, second in combinations((screen for screen in extended.values() if screen.mode != "preferred"), 2):
+        if overlaps(first.rect(), second.rect()):
+            raise ValueError(f"{first.name} and {second.name} overlap. Move one of them apart.")
+
+
+def aligned_edge(position, size, start, length, tolerance):
+    position = max(start - size + 1, min(start + length - 1, position))
+    target = min(
+        (start, round(start + (length - size) / 2), start + length - size),
+        key=lambda value: abs(value - position),
+    )
+    return target if abs(target - position) <= tolerance else position
+
+
+def snap(dragged, others, distance):
+    x, y, width, height = dragged
+    candidates = []
+    for ox, oy, ow, oh in others:
+        sx = aligned_edge(x, width, ox, ow, distance)
+        sy = aligned_edge(y, height, oy, oh, distance)
+        candidates.extend(((ox - width, sy), (ox + ow, sy), (sx, oy - height), (sx, oy + oh)))
+    clear = [
+        (sx, sy) for sx, sy in candidates
+        if all(not overlaps((sx, sy, width, height), other) for other in others)
+    ]
+    return min(clear, key=lambda point: hypot(point[0] - x, point[1] - y), default=None)
+
+
+def normalize_layout(displays):
+    extended = [screen for screen in displays.values() if screen.extended]
+    left = min(screen.x for screen in extended)
+    top = min(screen.y for screen in extended)
+    for screen in extended:
+        screen.x -= left
+        screen.y -= top
+
+
+def fit_in_layout(screen, others):
+    if not screen.extended or screen.mode == "preferred":
+        return
+    rectangles = [other.rect() for other in others if other.extended and other.mode != "preferred"]
+    if any(overlaps(screen.rect(), rect) for rect in rectangles):
+        point = snap(screen.rect(), rectangles, 0)
+        if point is None:
+            point = (max(x + width for x, _, width, _ in rectangles), screen.y)
+        screen.x, screen.y = point
+
+
+def change_display_power(displays, name, enabled):
+    draft = {key: replace(screen) for key, screen in displays.items()}
+    selected = draft[name]
+    selected.enabled = enabled
+    if enabled:
+        if selected.mirror and not (selected.mirror in draft and draft[selected.mirror].extended):
+            selected.mirror = ""
+        fit_in_layout(selected, (screen for key, screen in draft.items() if key != name))
+    else:
+        for screen in draft.values():
+            if screen.enabled and screen.mirror == name:
+                screen.mirror = ""
+                fit_in_layout(screen, (other for other in draft.values() if other != screen))
+    validate(draft)
+    return draft
+
+
+def saved_rules():
+    rules = {}
+    if LAYOUT_FILE.exists():
+        source = LAYOUT_FILE.read_text()
+        session = re.search(r'^local power_session = "([^"]*)"$', source, re.MULTILINE)
+        same_session = session and session[1] == os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        for line in source.splitlines():
+            match = re.fullmatch(r'hl\.monitor\(\{ output = "([\w.-]+)", .* \}\)', line)
+            if match:
+                rules[match.group(1)] = line if same_session else line.replace(OFF_RULE, "")
+    return rules
+
+
+def save_layout(displays):
+    rules = saved_rules()
+    for name, screen in displays.items():
+        rules[name] = screen.rule(saved=True)
+    off = [name for name, rule in rules.items() if OFF_RULE in rule]
+    header = "-- Generated by Display Settings.\n"
+    if off:
+        outputs = ", ".join(f"[{json.dumps(name)}] = true" for name in off)
+        session = json.dumps(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""))
+        header += f"""local power_session = {session}
+local requested_off = {{ {outputs} }}
+
+local function power_state()
+    -- Start a new login with the saved layout and the displays powered on.
+    if os.getenv("HYPRLAND_INSTANCE_SIGNATURE") ~= power_session then
+        return false, false
+    end
+    local another_screen, needs_recovery = false, false
+    for _, monitor in ipairs(hl.get_monitors({{ all = true }})) do
+        if monitor.name ~= "FALLBACK" and not monitor.name:match("^HEADLESS%-") then
+            if not requested_off[monitor.name] and monitor.enabled and not monitor.is_mirror then
+                another_screen = true
+            elseif requested_off[monitor.name] and not monitor.enabled then
+                needs_recovery = true
+            end
+        end
+    end
+    return another_screen, needs_recovery
+end
+
+local disable_outputs = power_state()
+hl.on("monitor.removed", function()
+    hl.timer(function()
+        local another_screen, needs_recovery = power_state()
+        if not another_screen and needs_recovery then
+            hl.dispatch(hl.dsp.reload_config())
+        end
+    end, {{ timeout = 200, type = "oneshot" }})
+end)
+
+"""
+    write_atomic(LAYOUT_FILE, header + "\n".join(rules.values()) + "\n")
+
+
+def write_atomic(path, contents):
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+        draft_file = Path(stream.name)
+        try:
+            stream.write(contents)
+            stream.flush()
+            draft_file.replace(path)
+        finally:
+            draft_file.unlink(missing_ok=True)
+
+
+def read_workspace_preferences():
+    source = WORKSPACE_PREFERENCES.read_text(encoding="utf-8")
+    primary = re.search(r'^\s*primary = "([A-Za-z0-9._-]*)",$', source, re.MULTILINE)
+    fixed = {
+        name: json.loads(workspace) for name, workspace in re.findall(
+            r'^\s*\["([A-Za-z0-9._-]+)"\] = ("(?:[^"\\]|\\.)*"),$', source, re.MULTILINE,
+        )
+    }
+    return primary[1] if primary else "", fixed
+
+
+def save_workspace_preferences(primary, fixed):
+    config = [
+        "-- Generated by Display Settings when display preferences are changed.",
+        "return {",
+        f"    primary = {json.dumps(primary)},",
+        "    fixed = {",
+    ]
+    for monitor, workspace in sorted(fixed.items()):
+        config.append(f"        [{json.dumps(monitor)}] = {json.dumps(workspace, ensure_ascii=False)},")
+    config.extend(("    },", "}", ""))
+    previous = WORKSPACE_PREFERENCES.read_text(encoding="utf-8")
+    contents = "\n".join(config)
+    write_atomic(WORKSPACE_PREFERENCES, contents)
+    try:
+        hyprctl("reload")
+    except ValueError:
+        if WORKSPACE_PREFERENCES.read_text(encoding="utf-8") == contents:
+            write_atomic(WORKSPACE_PREFERENCES, previous)
+        raise
+
+
+def scale_choices(screen):
+    width, height = screen.dimensions()
+    denominator = gcd(width, height) * 120
+    choices = {}
+    for preset in SCALE_PRESETS:
+        units = min(round(preset * 120), denominator)
+        while denominator % units:
+            units += 1
+        scale = units / 120
+        if scale not in choices or abs(scale - preset) < abs(scale - choices[scale]):
+            choices[scale] = preset
+    return sorted(choices.items(), key=lambda option: option[1])
+
+
+def prepare_display_size(displays, name, **settings):
+    previous = displays[name]
+    changed = replace(previous, **settings)
+    if any(abs(side - round(side)) > 0.01 for side in changed.size()):
+        changed.scale = min(scale_choices(changed), key=lambda item: abs(item[0] - previous.scale))[0]
+    draft = {key: replace(screen) for key, screen in displays.items()}
+    draft[name] = changed
+    if changed.extended:
+        _, _, old_width, old_height = previous.rect()
+        _, _, width, height = changed.rect()
+        others = [screen for screen in draft.values() if screen.name != name]
+        for screen in others:
+            if screen.extended:
+                if screen.x >= previous.x + old_width:
+                    screen.x += width - old_width
+                if screen.y >= previous.y + old_height:
+                    screen.y += height - old_height
+        fit_in_layout(changed, others)
+        normalize_layout(draft)
+    return draft
+
+
+def lock_display_edit():
+    lock = (LAYOUT_FILE.parent / ".display-settings.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        lock.close()
+        if isinstance(error, BlockingIOError):
+            raise ValueError("Another display change is in progress. Try again in a moment.") from error
+        raise
+    return lock
+
+
+def apply_display_rules(current, draft):
+    changed = [screen for screen in draft.values() if screen != current[screen.name]]
+    changed.sort(key=lambda screen: not screen.enabled)
+    hyprctl("eval", " ".join(screen.rule() for screen in changed))
+
+
+def verify_display_rules(draft):
+    live = read_displays()
+    if live.keys() != draft.keys():
+        raise ValueError("The connected displays changed while applying the layout.")
+    verified = {}
+    for name, requested in draft.items():
+        actual = live[name]
+        if actual.enabled != requested.enabled:
+            raise ValueError(f"Hyprland did not turn {name} {'on' if requested.enabled else 'off'}.")
+        if not requested.enabled:
+            verified[name] = replace(
+                actual, mode=requested.mode, x=requested.x, y=requested.y,
+                scale=requested.scale, transform=requested.transform, mirror=requested.mirror,
+            )
+            continue
+        if requested.mode != "preferred" and (
+            actual.mode != requested.mode or actual.transform != requested.transform
+            or actual.mirror != requested.mirror or abs(actual.scale - requested.scale) > 0.005
+            or (requested.extended and (actual.x, actual.y) != (requested.x, requested.y))
+        ):
+            raise ValueError(f"Hyprland did not apply the requested settings for {name}.")
+        verified[name] = replace(actual, x=requested.x, y=requested.y) if actual.mirror else actual
+    return verified
+
+
+def change_workspace_preference(name, setting, enabled):
+    primary, fixed = read_workspace_preferences()
+    if enabled:
+        screen = read_displays()[name]
+        if not screen.extended:
+            raise ValueError("Turn on this display in Extend mode first.")
+    if setting == "primary":
+        if enabled:
+            primary = name
+        elif primary == name:
+            primary = ""
+    elif enabled and name not in fixed:
+        workspace = screen.active_workspace
+        if not workspace or any(ord(char) < 32 for char in workspace):
+            raise ValueError("Select a regular workspace on this display before fixing it.")
+        fixed[name] = workspace
+    elif not enabled:
+        fixed.pop(name, None)
+    save_workspace_preferences(primary, fixed)
+
+
+def plugin_display_state():
+    primary, fixed = read_workspace_preferences()
+    displays = []
+    for screen in read_displays().values():
+        displays.append({
+            **asdict(screen), "primary": screen.name == primary, "dedicated": screen.name in fixed,
+            "scale_options": sorted({screen.scale, *(value for value, _ in scale_choices(screen))})
+            if screen.mode != "preferred" else [],
+            "rect": screen.rect() if screen.extended and screen.mode != "preferred" else None,
+        })
+    return {"displays": displays}
+
+
+def plugin_layout_draft(displays, name, setting, value):
+    screen = displays[name]
+    if setting == "enabled" and value in ("on", "off"):
+        return change_display_power(displays, name, value == "on")
+    if not screen.enabled:
+        raise ValueError("Turn on this display first.")
+    if setting == "mode" and value in screen.modes:
+        return prepare_display_size(displays, name, mode=value)
+    if screen.mode != "preferred":
+        if setting == "scale" and float(value) in {scale for scale, _ in scale_choices(screen)} | {screen.scale}:
+            return prepare_display_size(displays, name, scale=float(value))
+        if setting == "rotation" and value in ("0", "1", "2", "3"):
+            return prepare_display_size(displays, name, transform=int(value))
+    if setting == "mirror" and (value == "" or (value != name and displays[value].extended)):
+        draft = {key: replace(display) for key, display in displays.items()}
+        draft[name].mirror = value
+        fit_in_layout(draft[name], (display for key, display in draft.items() if key != name))
+        return draft
+    if setting in ("left", "right", "above", "below") and screen.extended and value != name:
+        reference = displays[value]
+        if not reference.extended or "preferred" in (screen.mode, reference.mode):
+            raise ValueError("Both displays need to be on in Extend mode.")
+        x, y, width, height = reference.rect()
+        _, _, own_width, own_height = screen.rect()
+        positions = {"left": (x - own_width, y), "right": (x + width, y),
+                     "above": (x, y - own_height), "below": (x, y + height)}
+        draft = {key: replace(display) for key, display in displays.items()}
+        draft[name].x, draft[name].y = positions[setting]
+        normalize_layout(draft)
+        return draft
+    raise ValueError("This setting is unavailable for the selected display.")
+
+
+def apply_plugin_setting(name, setting, value):
+    with lock_display_edit():
+        if setting in ("primary", "dedicated") and value in ("on", "off"):
+            change_workspace_preference(name, setting, value == "on")
+            return
+        current = read_displays()
+        draft = plugin_layout_draft(current, name, setting, value)
+        validate(draft)
+        if draft == current:
+            return
+        try:
+            apply_display_rules(current, draft)
+            for attempt in range(5):
+                sleep(0.35 if not attempt else 0.3)
+                try:
+                    verified = verify_display_rules(draft)
+                    break
+                except (OSError, ValueError, KeyError, TypeError):
+                    if attempt == 4:
+                        raise
+            save_layout(verified)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            try:
+                hyprctl("reload")
+            except ValueError as restore_error:
+                raise ValueError(f"{error} Could not restore the saved setup. {restore_error}") from error
+            raise
+
+
+def plugin_command(args):
+    try:
+        match args:
+            case ["inspect"]:
+                pass
+            case ["set", name, setting, value]:
+                apply_plugin_setting(name, setting, value)
+            case _:
+                raise ValueError("Expected an inspect or set request.")
+        print(json.dumps(plugin_display_state()))
+        return 0
+    except KeyError:
+        print("The selected display is no longer available.", file=sys.stderr)
+    except (OSError, ValueError, TypeError) as error:
+        print(error, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args[:1] == ["--noctalia-plugin"]:
+        args = args[1:]
+    raise SystemExit(plugin_command(args))

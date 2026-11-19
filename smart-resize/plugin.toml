@@ -1,0 +1,15 @@
+id = "clementgayet/smart-resize"
+name = "Smart Resize"
+description = "Use the cursor position to grab an edge or corner of a Hyprland window."
+author = "clementgayet"
+version = "0.1.0"
+icon = "arrows-diagonal"
+plugin_api = 24
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 360
+height = 260
+placement = "floating"
+position = "center"
