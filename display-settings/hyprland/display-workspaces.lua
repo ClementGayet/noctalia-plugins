@@ -12,8 +12,16 @@ end
 
 local function selector(workspace)
     if not workspace then return nil end
-    if workspace.id and workspace.id > 0 then return tostring(workspace.id) end
-    return workspace.addressable_name
+    if workspace.id then return tostring(workspace.id) end
+    local address = workspace.addressable_name
+    if not address or workspace.special then return address end
+    -- Hyprland 0.57 exposes a bare address for named workspaces.
+    return "name:" .. address
+end
+
+local function monitor_name(workspace)
+    local monitor = workspace and workspace.monitor
+    return monitor and monitor.name
 end
 
 for monitor in pairs(preferences.fixed) do
@@ -23,83 +31,93 @@ for monitor in pairs(preferences.fixed) do
     hl.workspace_rule({ workspace = workspace, monitor = monitor, default = true, persistent = true })
 end
 
-local primary_owns_workspace_one = primary ~= "" and not fixed[primary]
-if primary_owns_workspace_one then
-    hl.workspace_rule({ workspace = "1", monitor = primary, default = true })
+local function place_fixed(name, keep_windows)
+    local monitor = hl.get_monitor(name)
+    if not usable(monitor) then return end
+    local target = fixed[name]
+    local dedicated = hl.get_workspace(target)
+    local old = selector(monitor.active_workspace)
+    if old == target and monitor_name(dedicated) == name then return monitor end
+
+    local windows = {}
+    if keep_windows and old and old == preferences.fixed[name] and not owners[old]
+        and (not dedicated or dedicated.is_empty) then
+        windows = hl.get_workspace_windows(old)
+    end
+    -- The monitor method reassigns a workspace even if another output already owns it.
+    monitor:set_workspace(target)
+    if monitor_name(hl.get_workspace(target)) ~= name then return end
+    for _, window in ipairs(windows) do
+        hl.dispatch(hl.dsp.window.move({ window = window, workspace = target, follow = false }))
+    end
+    return monitor
 end
 
-local function restore_fixed(name, keep_windows)
-    if not fixed[name] then return end
+local function schedule_repair(name, keep_windows)
     if pending[name] then
         if keep_windows then pending[name].keep_windows = true end
         return
     end
-    local monitor = hl.get_monitor(name)
-    if not usable(monitor) or selector(monitor.active_workspace) == fixed[name] then return end
     local request = { keep_windows = keep_windows }
     pending[name] = request
     hl.timer(function()
         pending[name] = nil
+        if fixed[name] then
+            place_fixed(name, request.keep_windows)
+            return
+        end
         local monitor = hl.get_monitor(name)
-        if usable(monitor) and selector(monitor.active_workspace) ~= fixed[name] then
-            local old = selector(monitor.active_workspace)
-            local dedicated = hl.get_workspace(fixed[name])
-            local windows = {}
-            if request.keep_windows and old == preferences.fixed[name] and (not dedicated or dedicated.is_empty) then
-                windows = hl.get_workspace_windows(old)
-            end
-            monitor:set_workspace(fixed[name])
-            for _, window in ipairs(windows) do
-                hl.dispatch(hl.dsp.window.move({ window = window, workspace = fixed[name], follow = false }))
-            end
+        if not usable(monitor) then return end
+        local owner = owners[selector(monitor.active_workspace)]
+        if not owner then return end
+        if usable(hl.get_monitor(owner)) then
+            place_fixed(owner)
+            return
+        end
+        -- Hyprland may temporarily store a disconnected output's workspaces
+        -- on another monitor. Keep its dedicated workspace out of view there.
+        local previous = hl.get_last_workspace(name)
+        if previous and not previous.special and not owners[selector(previous)] and monitor_name(previous) == name then
+            monitor:set_workspace(selector(previous))
+        else
+            monitor:set_workspace("emptym")
         end
     end, { timeout = 20, type = "oneshot" })
 end
 
-local function place_workspace_one()
-    if not primary_owns_workspace_one then return end
-    local monitor = hl.get_monitor(primary)
-    local workspace = hl.get_workspace(1)
-    if usable(monitor) and workspace and workspace.monitor and workspace.monitor.name ~= primary then
-        hl.dispatch(hl.dsp.workspace.move({ workspace = 1, monitor = primary }))
-    end
-end
-
 if next(fixed) then
-    hl.on("config.reloaded", function()
-        for name in pairs(fixed) do restore_fixed(name, true) end
-    end)
-    hl.on("workspace.active", function(workspace)
-        local monitor = workspace.monitor
-        if monitor and fixed[monitor.name] and fixed[monitor.name] ~= selector(workspace) then
-            restore_fixed(monitor.name)
+    local function repair_displays(keep_windows)
+        for _, monitor in ipairs(hl.get_monitors()) do
+            if usable(monitor) and (fixed[monitor.name] or owners[selector(monitor.active_workspace)]) then
+                schedule_repair(monitor.name, keep_windows)
+            end
         end
-    end)
-    hl.on("workspace.move_to_monitor", function(workspace, monitor)
-        local owner = owners[selector(workspace)]
-        if owner and owner ~= monitor.name then restore_fixed(owner) end
-    end)
-end
-
-hl.on("monitor.added", function(monitor)
-    restore_fixed(monitor.name)
-    if primary_owns_workspace_one and monitor.name == primary then
-        hl.timer(place_workspace_one, { timeout = 20, type = "oneshot" })
     end
-end)
 
-hl.on("hyprland.start", function()
-    for name in pairs(fixed) do restore_fixed(name) end
-    if primary == "" then return end
-    hl.timer(function()
-        local monitor = hl.get_monitor(primary)
+    hl.on("config.reloaded", function()
+        repair_displays(true)
+    end)
+    hl.on("hyprland.start", function() repair_displays() end)
+    hl.on("monitor.layout_changed", function() repair_displays() end)
+    hl.on("monitor.added", function(monitor)
+        if fixed[monitor.name] then schedule_repair(monitor.name) end
+    end)
+
+    local function check_workspace(workspace, monitor)
         if not usable(monitor) then return end
-        if primary_owns_workspace_one and selector(monitor.active_workspace) ~= "1" then
-            monitor:set_workspace(1)
+        local owner = owners[selector(workspace)]
+        if owner and owner ~= monitor.name then
+            schedule_repair(owner)
+            schedule_repair(monitor.name)
+        elseif fixed[monitor.name] and not owner then
+            schedule_repair(monitor.name)
         end
-        hl.dispatch(hl.dsp.focus({ monitor = primary }))
-    end, { timeout = 100, type = "oneshot" })
-end)
+    end
+    hl.on("workspace.active", function(workspace)
+        check_workspace(workspace, workspace and workspace.monitor)
+    end)
+    hl.on("workspace.move_to_monitor", check_workspace)
+end
 
 function M.switch_monitor()
     local current = hl.get_active_monitor()
@@ -113,14 +131,12 @@ function M.switch_monitor()
     end
 end
 
-function M.is_fixed_workspace(target)
-    local owner = owners[tostring(target)]
-    return owner and usable(hl.get_monitor(owner))
-end
-
 function M.focus_workspace(target)
-    if M.is_fixed_workspace(target) then
-        hl.dispatch(hl.dsp.focus({ workspace = target }))
+    local owner = owners[tostring(target)]
+    if owner then
+        if place_fixed(owner) then
+            hl.dispatch(hl.dsp.focus({ monitor = owner }))
+        end
         return
     end
 
@@ -131,42 +147,60 @@ function M.focus_workspace(target)
         hl.dispatch(hl.dsp.focus({ monitor = monitor.name }))
     end
 
-    local workspace = next(fixed) and hl.get_workspace(target)
-    if workspace and type(target) == "string" and target:match("^e[+-]1$") then
-        local prefix = target:sub(1, 2)
-        for offset = 2, #hl.get_workspaces() do
-            if not workspace or not M.is_fixed_workspace(selector(workspace)) then break end
-            target = prefix .. offset
-            workspace = hl.get_workspace(target)
+    local workspace
+    if next(fixed) then
+        workspace = hl.get_workspace(target)
+        if type(target) == "string" and target:match("^e[+-]1$") then
+            local prefix = target:sub(1, 2)
+            for offset = 2, #hl.get_workspaces() do
+                if not workspace or not owners[selector(workspace)] then break end
+                workspace = hl.get_workspace(prefix .. offset)
+            end
+            if not workspace then return end
+        elseif (target == "previous" or target == "previous_per_monitor") and not workspace then
+            return
         end
-    end
-    if workspace and M.is_fixed_workspace(selector(workspace)) then return end
-    if workspace and workspace.monitor and fixed[workspace.monitor.name] then
         local address = selector(workspace)
-        hl.dispatch(hl.dsp.workspace.move({ workspace = address, monitor = monitor.name }))
-        target = address
+        if owners[address] then return end
+        target = address or target
+    end
+    if fixed[monitor_name(workspace)] then
+        hl.dispatch(hl.dsp.workspace.move({ workspace = target, monitor = monitor.name }))
     end
 
     hl.dispatch(hl.dsp.focus({ workspace = target }))
 end
 
 function M.move_window_to_workspace(target, follow)
-    local destination = next(fixed) and M.switch_monitor()
-    if destination then
-        local workspace = hl.get_workspace(target)
-        if workspace and workspace.monitor and fixed[workspace.monitor.name] then
+    if not next(fixed) then
+        hl.dispatch(hl.dsp.window.move({ workspace = target, follow = follow }))
+        return
+    end
+
+    local workspace = hl.get_workspace(target)
+    local address = selector(workspace)
+    local owner = owners[tostring(target)] or owners[address]
+    if owner then
+        if not place_fixed(owner) then return end
+        hl.dispatch(hl.dsp.window.move({ workspace = fixed[owner], follow = follow }))
+        return
+    end
+
+    local destination = M.switch_monitor()
+    if not destination then return end
+    target = address or target
+    if fixed[monitor_name(workspace)] then
+        hl.dispatch(hl.dsp.workspace.move({ workspace = target, monitor = destination.name }))
+    end
+    local current = hl.get_active_monitor()
+    if not workspace and current and fixed[current.name] then
+        hl.dispatch(hl.dsp.window.move({ workspace = target, follow = false }))
+        workspace = hl.get_workspace(target)
+        if fixed[monitor_name(workspace)] then
             hl.dispatch(hl.dsp.workspace.move({ workspace = target, monitor = destination.name }))
         end
-        local current = hl.get_active_monitor()
-        if not workspace and current and fixed[current.name] then
-            hl.dispatch(hl.dsp.window.move({ workspace = target, follow = false }))
-            workspace = hl.get_workspace(target)
-            if workspace and workspace.monitor and fixed[workspace.monitor.name] then
-                hl.dispatch(hl.dsp.workspace.move({ workspace = target, monitor = destination.name }))
-            end
-            if workspace and follow then M.focus_workspace(target) end
-            return
-        end
+        if workspace and follow then M.focus_workspace(target) end
+        return
     end
     hl.dispatch(hl.dsp.window.move({ workspace = target, follow = follow }))
 end

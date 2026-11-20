@@ -4,4 +4,6 @@ Open **Displays** from the bar or from the Control Center Home shortcut. In **Ar
 
 The backend expects a Hyprland Lua configuration that loads `display-layout.lua` and `display-workspaces.lua`. The latter is in `hyprland/` and reads the generated `display-workspace-preferences.lua`. Keep those two generated files in the Hyprland configuration directory. They hold this machine’s monitor layout and preferences.
 
+Dedicated workspaces stay with their configured displays. The workspace switching helpers skip them during cycling, even while a display is disconnected. When it reconnects, the plugin restores its dedicated workspace and the windows on it.
+
 The backend uses Python 3 and `hyprctl`. Noctalia's built-in Monitor tab handles brightness.

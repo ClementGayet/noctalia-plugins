@@ -8,6 +8,7 @@ Local plugins for Noctalia 5.5 and Hyprland 0.57.
 | [Smart Resize](smart-resize/) | Drag from broad edge and corner zones inside a window |
 | [Tiling Preview](tiling-preview/) | Show tiled drop positions and stack windows in vertical rows |
 | [Window Shortcuts](window-shortcuts/) | Switch or close windows from the keyboard |
+| [Focus Flow](focus-flow/) | Pomodoro timer, daily tasks, and focus totals |
 
 ## Add the repository to Noctalia
 

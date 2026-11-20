@@ -1,7 +1,8 @@
 local function render(status)
     panel.render(ui.column({ padding = 14, gap = 10 }, {
         ui.label({ text = "Smart Resize", fontSize = 20, fontWeight = "semibold" }),
-        ui.label({ text = "Super + R  or  Super + right drag", fontWeight = "semibold" }),
+        ui.label({ text = "Super + right drag", fontWeight = "semibold" }),
+        ui.label({ text = "Keyboard alternative: Super + R", color = "on_surface_variant" }),
         ui.label({
             text = "Start inside the window. The side or corner nearest the cursor follows your drag.",
             maxWidth = 310, maxLines = 3, color = "on_surface_variant",

@@ -1,0 +1,10 @@
+{
+  "settings.focus_minutes.label": "Focus duration",
+  "settings.focus_minutes.description": "Length of each focus session in minutes.",
+  "settings.short_break_minutes.label": "Short break",
+  "settings.short_break_minutes.description": "Length of a short break in minutes.",
+  "settings.long_break_minutes.label": "Long break",
+  "settings.long_break_minutes.description": "Length of a long break in minutes.",
+  "settings.sessions_until_long_break.label": "Sessions before long break",
+  "settings.sessions_until_long_break.description": "Completed focus sessions between long breaks."
+}

@@ -17,4 +17,4 @@ local function resize()
 end
 
 hl.bind("SUPER + mouse:273", resize, { mouse = true, description = "Resize the window under the pointer" })
-hl.bind("SUPER + R", resize, { mouse = true, description = "Resize the window under the pointer with the keyboard" })
+hl.bind("SUPER + R", resize, { description = "Resize the window under the pointer with the keyboard" })
